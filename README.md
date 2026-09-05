@@ -3,6 +3,11 @@
 This repo contains a guideline for developing and submitting a method into the [AIMO Interpretability Challenge](https://aimo-interp.github.io/). It uses the
 **representation classifier probe** as a complete, working example.
 
+> **Путеводитель на русском:** начни с [`travel_guide/README.md`](travel_guide/README.md).
+> Четыре главы: путь данных, математика и тензоры двух методов, точки изменений.
+> Справочники, код с комментариями и маленькие CPU-примеры открываются по необходимости.
+> Перед локальным запуском проверь [известные несовпадения starter-kit](travel_guide/reference/pitfalls.md).
+
 ## Contents
 
 - [What your method does](#what-your-method-does)

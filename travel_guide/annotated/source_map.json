@@ -1,0 +1,27 @@
+{
+  "source_commit": "e46be92387081cfb8edf275e573fec7884eb9f32",
+  "snapshots": [
+    {
+      "file": "annotated/ingestion_core.py",
+      "source": "components/ingestion_program/ingestion.py",
+      "symbols": {"_run": "_run"}
+    },
+    {
+      "file": "annotated/probe_core.py",
+      "source": "solutions/trained-probe/probe_inference.py",
+      "symbols": {
+        "_layer_index": "_layer_index",
+        "_encode_problem": "_encode_problem",
+        "mean_ensemble_margin": "mean_ensemble_margin"
+      }
+    },
+    {
+      "file": "annotated/collector_core.py",
+      "source": "solutions/uncertainty-profiling/uncertainty_profile/extraction.py",
+      "symbols": {
+        "GenerationConfidenceCollector.__call__": "GenerationConfidenceCollector.__call__",
+        "GenerationConfidenceCollector.compute_features": "GenerationConfidenceCollector.compute_features"
+      }
+    }
+  ]
+}
