@@ -1,0 +1,5 @@
+interface:
+  display_name: "AIMO: bounded experiment"
+  short_description: "Run an approved, bounded experiment"
+policy:
+  allow_implicit_invocation: false
