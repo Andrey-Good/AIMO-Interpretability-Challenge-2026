@@ -1,401 +1,117 @@
-# AIMO Interpretability Challenge
+# AIMO: три файла для исследования
 
-This repo contains a guideline for developing and submitting a method into the [AIMO Interpretability Challenge](https://aimo-interp.github.io/). It uses the
-**representation classifier probe** as a complete, working example.
+**Меняй научный замысел, а не обвязку.** Здесь предсказывается устойчивость пары
+«LLM + задача», а не математический ответ. Старые baseline в `solutions/` сохранены.
 
-> **Путеводитель на русском:** начни с [`travel_guide/README.md`](travel_guide/README.md).
-> Четыре главы: путь данных, математика и тензоры двух методов, точки изменений.
-> Справочники, код с комментариями и маленькие CPU-примеры открываются по необходимости.
-> Перед локальным запуском проверь [известные несовпадения starter-kit](travel_guide/reference/pitfalls.md).
+## Что читать
 
-## Contents
+[features.py](research/features.py) — текст → токены → запуск LLM → последний
+немаскированный токен выбранных слоёв. Получается `[B,K,D]`: B задач, K слоёв,
+D координат состояния. Это состояния **промпта**, генерации ответа в этом шаблоне нет.
 
-- [What your method does](#what-your-method-does)
-- [Prerequisites](#prerequisites)
-- [Quick start](#quick-start)
-- [Which data is available?](#which-data-is-available)
-- [Example method: trained representation probe](#example-method-trained-representation-probe)
-- [Example method: uncertainty profiling](#example-method-uncertainty-profiling)
-- [Runtime and available libraries](#runtime-and-available-libraries)
-- [Evaluation environment](#evaluation-environment)
-- [What to submit](#what-to-submit)
-- [Check the submission locally](#check-the-submission-locally)
-- [How to submit](#how-to-submit)
-- [Repository layout](#repository-layout)
+[predictor.py](research/predictor.py) — архитектура головы и её применение.
+По умолчанию `[B,K,D] → [B,K*D] → Linear(...,1)`. `--width 128` добавляет скрытый слой
+из 128 нейронов и ReLU. Sigmoid превращает выход в модельную оценку вероятности,
+но не гарантирует её калибровку. `--threshold` задаёт границу True/False.
 
-## What your method does
+[experiment.py](research/experiment.py) — весь опыт сверху вниз: получить признаки,
+по **train** вычислить центр/масштаб, обучить голову с BCE, проверить на validation,
+сравнить с постоянным прогнозом. В нём видны loss, optimizer и оценка; LLM не дообучается.
 
-For each model and batch of mathematical problems, your method predicts whether
-the model's behavior is robust:
+Это три небольших файла. `_support.py` загружает/сохраняет, кеширует и обрабатывает команды;
+читать его для выбора признаков/архитектуры не требуется. Шаблон промпта, маски, слои,
+обрезание и нормировка остаются явно заданными параметрами, не «скрытой рутиной».
 
-```python
-are_robust(model_id: str, problems: list[str]) -> list[bool]
-```
+## Запуск
 
-The ingestion program validates this exact annotated signature. The returned
-list must:
+Нужны окружение проекта (`uv sync`), разрешённые локальные данные и уже закешированный
+checkpoint. Программа ничего сама не скачивает и не вызывает платные API.
+Сначала можно проверить всё без модели: `python -m unittest discover -s research/tests -v`.
 
-- contain exactly one prediction per input problem;
-- preserve the input order;
-- contain real Python `bool` values, not integers or NumPy boolean scalars;
-- use `True` for robust and `False` for not robust.
-
-Your method can load the specified language model (`model_id`) through Hugging
-Face, run inference on the supplied `problems`, and predict whether the model is
-robust on each problem. You may use or extend any available Hugging Face
-functionality and combine signals from the forward pass to produce the
-robustness predictions.
-
-Model weights are available through the evaluation worker's offline Hugging
-Face cache. You do not have access to other models.
-
-## Prerequisites
-
-You need:
-
-- Python 3.11+ and [`uv`](https://docs.astral.sh/uv/) for the local tooling;
-- `git` to clone the repository;
-- Docker, if you want to reproduce the offline evaluation container locally
-  (recommended before submitting).
-
-Clone the repository and install dependencies:
-
-```bash
-git clone git@github.com:aimo-interp/getting-started.git
-cd getting-started
-uv sync
-```
-
-## Quick start
-
-The fastest path from a fresh clone to a scored local run:
-
-```bash
-# 1. Import the public validation sample into data/val-sample/.
-uv run scripts/import_hf_dataset.py
-
-# 2. Score the example method on that sample.
-uv run scripts/run_local.py solutions/trained-probe \
-  --input-dir data/val-sample/input \
-  --reference-dir data/val-sample/reference
-```
-
-Without a trained probe artifact, the example predicts `False` for every case
-(a valid but trivial baseline). The rest of this guide explains how to plug in a
-real artifact, package a submission, and validate it. To write your own method,
-copy `solutions/trained-probe/` and replace the implementation behind
-`are_robust`.
-
-## Which data is available?
-
-### Public development data
-
-The public validation sample is
-[`aimo-interp/val-sample`](https://huggingface.co/datasets/aimo-interp/val-sample).
-It contains examples with:
-
-- `model_id`: the model whose robustness is being evaluated;
-- `original_problem`: the mathematical problem text;
-- `permutation_type`: the relevant perturbation categories;
-- `model_is_robust`: the public development label.
-
-Import it into this repository with:
-
-```bash
-uv run scripts/import_hf_dataset.py
-```
-
-This creates:
-
-```text
-data/val-sample/
-├── input/
-│   └── cases.jsonl
-├── reference/
-│   └── labels.jsonl
-└── metadata.json
-```
-
-The public labels are for development only. The final evaluation uses separate
-private problems and labels.
-
-### Data available during evaluation
-
-For each call, the trained probe receives a `model_id` and a list of `str`.
-
-Your submission does not receive case IDs, reference labels, private dataset
-files, or network access.
-
-## Example method: trained representation probe
-
-This baseline demonstrates how to compose a solution.
-
-Start with this directory:
-
-```text
-trained-probe/
-├── solution.py
-├── probe_inference.py
-└── probe_artifacts/
-    └── probe_artifact.pkl
-```
-
-The `solution.py` file defines only the Codabench interface:
-
-```python
-from probe_inference import predict_robustness
-
-def are_robust(model_id: str, problems: list[str]) -> list[bool]:
-    return predict_robustness(model_id, problems)
-```
-
-`probe_inference.py` contains the implementation in three sections:
-
-1. **Artifact loading:** find and validate `probe_artifact.pkl`.
-2. **Hidden-state extraction:** load the offline model, format the problem,
-   perform a forward pass, and select the final prompt-token representation
-   from the model layer.
-3. **Probe scoring:** apply a collection of linear probes and average their
-   margins.
-
-For one probe, the decision is:
-
-```python
-margin = weights @ hidden_state + bias - threshold
-prediction = margin >= 0
-```
-
-The ensemble averages these margins and returns `True` when the mean is
-non-negative. The artifact stores weights, biases, thresholds, the selected
-layer, the Hugging Face model ID, and the system prompt. It does not contain
-precomputed hidden states.
-
-## Example method: uncertainty profiling
-
-The repository also provides `solutions/uncertainty-profiling/`. This baseline
-generates a deterministic response to each original problem and summarizes the
-generated-token distributions with 14 confidence and uncertainty statistics.
-A pretrained scikit-learn regressor maps those features to predicted absolute
-accuracy decay; the artifact's cross-validated threshold converts the score to
-the required robustness boolean.
-
-The motivation is to measure robustness through uncertainty over the model's
-generated reasoning trace: robust and spurious reasoning may produce different
-token-level uncertainty signatures. This follows the general perspective of
-[Tracing Uncertainty in Language Model "Reasoning"](https://arxiv.org/abs/2605.07776),
-while using a simpler set of 14 aggregate trace features.
-
-Training is deliberately separate from submission inference. Generate a
-resumable feature cache from the pinned public aggregate dataset:
-
-```bash
-uv run solutions/uncertainty-profiling/scripts/compute_uncertainty_features.py \
-  --cache-dir /path/to/huggingface/cache
-```
-
-Then select the regressor and threshold with grouped cross-validation, refit on
-all feature rows, and export the joblib artifact directly into the solution:
-
-```bash
-uv run solutions/uncertainty-profiling/scripts/train_uncertainty_regressor.py \
-  --feature-data-path \
-  data/uncertainty-profiling/deepseek-ai_DeepSeek-R1-0528-Qwen3-8B_confidence_features.parquet
-```
-
-The resulting solution is offline and self-contained. During evaluation it
-resolves the Codabench alias `qwen3-8b:low` to the cached
-`deepseek-ai/DeepSeek-R1-0528-Qwen3-8B` checkpoint, then loads the matching
-bundled regressor artifact. It uses greedy decoding with a 2,048-token prompt
-cap and a 4,096-token response cap. See
-`solutions/uncertainty-profiling/README.md` for the complete feature list,
-artifact provenance, and CV search.
-
-## Runtime and available libraries
-
-The evaluation container is offline. It does not run `pip install`, `uv sync`,
-or a submitted `requirements.txt`.
-
-**You may rely only on the Python standard library and packages provided by
-[`Dockerfile.competition`](Dockerfile.competition).** The current runtime
-provides:
-
-- PyTorch `2.12.1` with CUDA `13.2`;
-- Accelerate `1.13.0`;
-- Hugging Face Hub `1.22.0`;
-- joblib `1.5.3`;
-- pandas `3.0.3`;
-- safetensors `0.8.0`;
-- scikit-learn `1.8.0`;
-- tokenizers `0.22.2`;
-- Transformers `5.13.0`.
-
-Important consequences:
-
-- A package installed only on your laptop or cluster login environment will not
-  exist during evaluation.
-- Adding `requirements.txt` to the ZIP does not install anything.
-- Artifacts serialized with scikit-learn or joblib should be trained with the
-  runtime versions above.
-- Model and tokenizer loading must work offline, so rely only on the model ID
-  passed to `are_robust`. Do not call external APIs or download from Hugging
-  Face during evaluation.
-- You may include your own Python source files and pretrained data artifacts in
-  the ZIP, such as pretrained probes, provided they comply with the competition
-  rules.
-
-## Evaluation environment
-
-Each submission is evaluated on a dedicated GPU worker with the following
-resources:
-
-- **GPU:** one NVIDIA RTX PRO 6000 (Blackwell, compute capability 12.0) with
-  96 GB of VRAM.
-- **CPU and RAM:** 192 cores with ample system memory; there is no per-container
-  memory cap.
-- **Time limit:** 3600 seconds per evaluation run, applied separately to the
-  prediction run and the scoring run. Loading the cached 8B model costs roughly
-  a minute of that budget.
-- **Network:** disabled inside evaluation containers. `HF_HUB_OFFLINE=1` and
-  `TRANSFORMERS_OFFLINE=1` are preset.
-- **Model cache:** a read-only Hugging Face cache is mounted at
-  `/app/data/huggingface`, and `HF_HOME` already points to it, so
-  `from_pretrained(...)` resolves cached models with no extra configuration.
-  Pass `local_files_only=True` to fail fast on anything not cached.
-
-Models currently available in the cache:
-
-- `deepseek-ai/DeepSeek-R1-0528-Qwen3-8B`
-
-Models outside this list cannot be loaded during evaluation. Contact the
-organizers if your method needs another model cached on the workers.
-
-## What to submit
-
-Submit one ZIP archive containing:
-
-- `solution.py` at the archive root;
-- any helper modules or Python packages imported by `solution.py`;
-- all pretrained artifacts needed, such as the trained probes;
-- optional configuration files.
-
-Do not submit:
-
-- training datasets or private labels;
-- model weights already supplied by the evaluation worker;
-- virtual environments, caches, `__pycache__`, or installed packages;
-- credentials, API keys, or code that requires network access.
-
-Correct ZIP layout, for the probing example:
-
-```text
-baseline-submission-bundle.zip
-├── solution.py
-├── probe_inference.py
-└── probe_artifacts/
-    └── probe_artifact.pkl
-```
-
-Incorrect ZIP layout:
-
-```text
-baseline-submission-bundle.zip
-└── trained-probe/
-    └── solution.py
-```
-
-Build the archive from inside the method directory:
-
-```bash
-cd trained-probe
-zip -r ../baseline-submission-bundle.zip solution.py probe_inference.py probe_artifacts
-cd ..
-```
-
-Verify that `solution.py` is at the root:
-
-```bash
-unzip -l baseline-submission-bundle.zip
-```
-
-## Check the submission locally
-
-The repository already includes the method under `solutions/trained-probe/`.
-Copy the exported artifact into it:
-
-```text
-solutions/
-└── trained-probe/
-    ├── solution.py
-    ├── probe_inference.py
-    └── probe_artifacts/
-        └── probe_artifact.pkl
-```
-
-```bash
-mkdir -p solutions/trained-probe/probe_artifacts
-cp /path/to/probe_artifact.pkl \
-  solutions/trained-probe/probe_artifacts/probe_artifact.pkl
-```
-
-Run the public validation sample:
-
-```bash
-uv run scripts/run_local.py solutions/trained-probe \
-  --input-dir data/val-sample/input \
-  --reference-dir data/val-sample/reference
-```
-
-Expected output has this shape:
+Источник — JSON-массив, JSONL или Parquet. Минимальная строка, **иллюстрация схемы**:
 
 ```json
-{
-  "accuracy": 0.7,
-  "coverage": 1.0,
-  "invalid_predictions": 0
-}
+{"id":"q17-v2","family_id":"q17","problem":"текст условия","is_robust":true,"model_id":"qwen3-8b:low"}
 ```
 
-The accuracy shown above is only an example. Before submission, require:
+`family_id` общий для всех вариантов одной исходной задачи. Поддерживаются также
+исходные поля `original_problem`, `model_is_robust`, `dataset_id` + `problem_id`.
+Нельзя назначать каждой переформулировке новую семью. Для другой LLM подготовь отдельное исследование.
 
-- `coverage` equal to `1.0`;
-- `invalid_predictions` equal to `0`;
-- deterministic predictions across repeated runs;
-- successful execution in the competition Docker image, not only in a local
-  virtual environment.
-
-Build all repository artifacts with:
+Подготовить групповое разбиение локального источника (директория выхода должна быть новой):
 
 ```bash
-uv run scripts/build.py all \
-  --input-dir data/val-sample/input \
-  --reference-dir data/val-sample/reference
+uv run python -m research.experiment prepare --source data/source.jsonl --out data/study --model deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 ```
 
-This creates a solution ZIP. For the probing example, the output is
-`dist/solution-trained-probe.zip`.
+Либо передай свои проверенные train/validation-файлы. `prepare` не определяет смысл
+семейств за тебя и не создаёт независимый финальный тест. Validation — для разработки;
+после перебора методов нужен отдельно отложенный набор, который не использовался в поиске.
 
-## How to submit
+Пример маленького запуска; размер/слои/устройство и бюджет выбираются по доступному оборудованию:
 
-1. Sign in to the AIMO Interpretability Challenge on [Codabench](https://www.codabench.org/competitions/16180/#/pages-tab).
-2. Open the active submission phase.
-3. Upload `baseline-submission-bundle.zip` or the generated
-   `dist/solution-trained-probe.zip`.
-4. Wait for ingestion and scoring to finish.
-5. Check `coverage` and `invalid_predictions` before interpreting accuracy.
-
-An invalid prediction usually means the method raised an exception, returned a
-non-boolean value, or returned the wrong number of predictions. Detailed
-participant exceptions may be hidden by the evaluator, so reproduce failures
-locally with the same Docker image.
-
-
-### Repository layout
-
-```text
-components/             the Codabench ingestion and scoring programs, used by run_local.py
-data/val-sample/        generated public validation import (ignored)
-scripts/                dataset importer, local runner, and archive builder
-solutions/              example methods, including the trained probe
-Dockerfile.competition  the evaluation runtime (exact package versions)
-pyproject.toml          local dependencies mirroring the runtime versions
+```bash
+uv run python -m research.experiment run --name depth-001 --train data/study/train.jsonl --validation data/study/validation.jsonl --model deepseek-ai/DeepSeek-R1-0528-Qwen3-8B --layers 16 --device cuda --dtype bfloat16 --max-seconds 600
 ```
+
+С другой головой: новая `--name`, например `depth-002`, и `--width 128`. Совпадающие
+признаки читаются из кеша без повторной загрузки весов LLM; tokenizer/config проверяются.
+Для настоящего большого прогона сначала измерь расход на малом наборе. По умолчанию
+устройство CPU; перенос на GPU явный. Индексы слоёв проверяются по фактической модели.
+
+## Где результат
+
+`experiments/<name>/result.json` — параметры, версия кода, хеши входов, метрики и статус.
+`accuracy` считает строки; `family_accuracy` даёт каждой исходной задаче равный вес.
+Нормировка и baseline используют только train. Статус completed не означает научное подтверждение.
+Неудачи тоже сохраняются. Важную гипотезу/решение можно дописать в короткий `notes.md` рядом;
+папки второй памяти и обязательных планов нет. Просмотри журнал перед публичным коммитом.
+
+`.runtime/` — локальные признаки, голова, прогнозы и снимок исходников; **не в Git**.
+Новый запуск не перезаписывает старый. Dirty-код разрешён для разведки: он явно помечен,
+его точный снимок сохранён; для подтверждения используй закоммиченную версию.
+Лимит времени проверяется между батчами/эпохами, не прерывает зависший вызов CUDA.
+Для жёсткого ограничения агент должен использовать таймаут процесса в своей среде.
+
+Собрать код и обученную голову именно данного запуска:
+
+```bash
+uv run python -m research.experiment export --name depth-001 --output dist/solution-depth-001.zip
+```
+
+В ZIP есть `solution.py` с `are_robust`, пакет `research` и `head.pt`; нет данных,
+памяти, навыков и кеша. Применение использует те же признаки/нормировку/голову.
+Модель, tokenizer и версии библиотек сверяются с обучением: чужие состояния не принимаются
+молча. Для Codabench обучай в совместимом закреплённом окружении и проверь ZIP в контейнере.
+Локальный путь checkpoint не переносится на сервер автоматически; там нужен доступный HF ID.
+
+## Работа через агента
+
+Ты общаешься с **Astra medium**. Она сама отвечает, для серьёзного планирования зовёт
+`researcher` — Astra high; для кода/опыта `worker` — Terra medium; для узкого поиска
+`explorer` — Luna low. Это роли в [.codex/agents](.codex/agents), не обязательная цепочка.
+Можно прерывать, возвращаться к вопросу и менять направление. Дополнительный независимый
+критик нужен по риску, а не после каждой строки. Максимум два помощника одновременно.
+
+[AGENTS.md](AGENTS.md) содержит только постоянные правила. Пять навыков:
+[исследование](.agents/skills/aimo-research/SKILL.md),
+[реализация](.agents/skills/aimo-implement/SKILL.md),
+[эксперимент](.agents/skills/aimo-experiment/SKILL.md),
+[проверка](.agents/skills/aimo-review/SKILL.md),
+[литература](.agents/skills/aimo-literature/SKILL.md).
+Это адаптации Superpowers и K-Dense, не полная установка их процессов:
+[источники, лицензии и изменения](.agents/skills/SOURCES.md).
+Открой доверенный проект в актуальном Codex, проверь `/model`, `/skills` и роли;
+файлы не отменяют ограничения аккаунта или явные настройки сессии.
+
+## Границы проверки и прежний starter-kit
+
+2026-09-07: новый путь проверен на CPU с явно тестовой LLM, включая обучение, кеш,
+ошибки и применение экспортированного ZIP в отдельной папке. Реальные HF checkpoint/GPU,
+маршрутизация подагентов в Codex и приём отправки Codabench здесь не проверялись.
+Это исполняемый шаблон, не полученный результат на AIMO и не гарантия конкурсной совместимости.
+
+Исходные `components/`, `scripts/`, `solutions/`, `tests/`, `pyproject.toml`, `uv.lock`
+и Dockerfile сохранены. Старые несовпадения importer/ingestion и часть старых тестов
+не исправлялись; новый prepare/run/export не использует этот несовместимый путь.
+Удалённые большие руководства остаются в [истории до упрощения](https://github.com/Andrey-Good/AIMO-Interpretability-Challenge-2026/tree/503a60f2f904841f23ff2a7364cd626e15ff3d24).

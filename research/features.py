@@ -1,59 +1,57 @@
-"""Промпт → LLM → последний немаскированный токен выбранных слоёв.
-
-B — задачи; T — токены; K — выбранные состояния; D — ширина состояния.
-Tokenizer/template/truncation должны быть явно записаны в feature_spec извне.
-Это состояния ПРОМПТА, не сгенерированного решения. Метки сюда не передаются.
+"""Что наблюдаем: последний токен промпта на выбранных слоях, без генерации.
+B — задачи в батче; T — длина с padding; K — слои; D — ширина состояния.
 """
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 
 
-def extract_features(
-    llm: nn.Module, batch: Mapping[str, Tensor], layers: Sequence[int]
-) -> Tensor:
-    """Return detached float32 [B,K,D], preserving batch and layer order.
-
-    Caller supplies tokenized, device-placed inputs. Works with left/right padding.
-    Requested indices refer to output.hidden_states, NOT necessarily block numbers.
-    Only standard input_ids/attention_mask are accepted to keep the contract explicit.
+@torch.no_grad()
+def extract_features(llm: nn.Module, tokenizer, texts: Sequence[str], *,
+                     layers: Sequence[int], max_length: int, template: str) -> Tensor:
+    """Строки → токены [B,T] → состояния [B,T,D] → признаки [B,K,D] на CPU.
+    Индексы layers относятся к tuple hidden_states, не автоматически к номерам блоков.
+    tokenizer/model загружены обвязкой. Меток y здесь нет.
     """
-    if set(batch) != {"input_ids", "attention_mask"}:
-        raise ValueError("batch must contain exactly input_ids and attention_mask")
-    ids, mask = batch["input_ids"], batch["attention_mask"]
-    if ids.ndim != 2 or mask.shape != ids.shape or 0 in ids.shape:
-        raise ValueError("nonempty input_ids and mask must have the same [B,T] shape")
-    if ids.dtype != torch.long or mask.device != ids.device:
-        raise ValueError("input_ids must be int64; mask must share its device")
-    if not torch.all((mask == 0) | (mask == 1)) or not torch.all(mask.bool().any(dim=1)):
-        raise ValueError("mask must be binary with at least one valid token per row")
-    if not layers or any(type(i) is not int for i in layers):
-        raise ValueError("layers must be a nonempty sequence of integer indices")
-    if len(set(layers)) != len(layers):
-        raise ValueError("duplicate layers would silently reweight features")
-
-    # Индекс ПОСЛЕДНЕЙ единицы; sum(mask)-1 неверен при левом padding.
-    positions = torch.arange(ids.shape[1], device=ids.device)
-    last = positions.expand_as(ids).masked_fill(~mask.bool(), -1).max(dim=1).values
-    previous_mode = llm.training
+    if not texts or any(not isinstance(t, str) or not t.strip() for t in texts):
+        raise ValueError("Expected nonempty problem strings")
+    if not layers or any(type(i) is not int or i < 0 for i in layers) or len(set(layers)) != len(layers):
+        raise ValueError("Use distinct nonnegative hidden-state indices")
+    if type(max_length) is not int or max_length < 1 or template not in {"plain", "chat"}:
+        raise ValueError("Invalid tokenization settings")
+    prompts = list(texts)
+    if template == "chat":
+        # Нет молчаливого fallback: другой шаблон означает другой эксперимент.
+        prompts = [tokenizer.apply_chat_template(
+            [{"role": "user", "content": t}], tokenize=False, add_generation_prompt=True
+        ) for t in texts]
+    tokenizer.padding_side = "right"
+    tokenizer.truncation_side = "right"
+    encoded = tokenizer(prompts, padding=True, truncation=True, max_length=max_length,
+                        add_special_tokens=template == "plain", return_tensors="pt")
+    device = llm.get_input_embeddings().weight.device
+    batch = {key: encoded[key].to(device) for key in ("input_ids", "attention_mask")}
+    mask = batch["attention_mask"]
+    if mask.ndim != 2 or mask.shape != batch["input_ids"].shape or mask.shape[1] == 0:
+        raise ValueError("Expected input_ids and mask with matching nonempty [B,T]")
+    if not torch.all((mask == 0) | (mask == 1)) or not mask.bool().any(dim=1).all():
+        raise ValueError("Every example needs a binary mask with a real token")
+    # Последняя ЕДИНИЦА маски; работает и при левом, и при правом padding.
+    last = torch.arange(mask.shape[1], device=device).expand_as(mask)
+    last = last.masked_fill(~mask.bool(), -1).amax(dim=1)
     llm.eval()
-    try:
-        with torch.no_grad():
-            output = llm(**batch, output_hidden_states=True, return_dict=True, use_cache=False)
-            states = output.hidden_states  # tuple: по [B,T,D] на каждый индекс
-            if states is None or any(i < 0 or i >= len(states) for i in layers):
-                raise ValueError("requested layer is outside hidden_states")
-            chosen = []
-            for i in layers:
-                h = states[i]
-                if h.ndim != 3 or h.shape[:2] != ids.shape:
-                    raise ValueError("hidden state must have shape [B,T,D]")
-                rows = torch.arange(ids.shape[0], device=h.device)
-                chosen.append(h[rows, last.to(h.device), :].detach().float())
-            # [B,D] для каждого слоя → [B,K,D]. Multi-device states copy to first.
-            x = torch.stack([h.to(chosen[0].device) for h in chosen], dim=1)
-            if not torch.isfinite(x).all():
-                raise ValueError("non-finite features")
-            return x
-    finally:
-        llm.train(previous_mode)
+    states = llm(**batch, output_hidden_states=True, return_dict=True,
+                 use_cache=False).hidden_states
+    if states is None or max(layers) >= len(states):
+        raise ValueError("Requested state index does not exist")
+    selected = []
+    for layer in layers:
+        h = states[layer]  # [B,T,D]
+        if h.ndim != 3 or h.shape[:2] != mask.shape:
+            raise ValueError("Unexpected hidden-state shape")
+        rows = torch.arange(len(texts), device=h.device)
+        selected.append(h[rows, last.to(h.device)].float().cpu())  # [B,D]
+    x = torch.stack(selected, dim=1)  # [B,K,D], layer order preserved
+    if not torch.isfinite(x).all():
+        raise ValueError("Nonfinite features")
+    return x

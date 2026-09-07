@@ -4,10 +4,9 @@ data/
 dist/
 .idea/
 solutions/*.zip
-
-# Local experiment outputs and logs; commit only reviewed small records.
 .runtime/
 *.pyc
 .env
 .env.*
 !.env.example
+.pytest_cache/
