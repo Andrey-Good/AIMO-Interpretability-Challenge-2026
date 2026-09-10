@@ -1,11 +1,17 @@
 """Читать сверху вниз: признаки → обучение головы → честное сравнение.
 CLI/файлы/кеш находятся в _support.py. python -m research.experiment --help
 """
+import gc
+import json
+import signal
+from pathlib import Path
 import torch
 from torch.nn import functional as F
 from research.features import extract_features
 from research.predictor import build_predictor, normalize, predict
 from research import _support as io
+from research._activation_store import plan_cases, require_cuda
+from research._collector import collect_all
 
 
 def run(args, record) -> None:
@@ -61,6 +67,44 @@ def run(args, record) -> None:
                   accuracy=float(correct.float().mean()), family_accuracy=sum(group_accuracy) / len(families),
                   majority_accuracy=float((y_valid.bool() == majority).float().mean()))
     io.save_outputs(args, head, mean, scale, feature_spec, valid, p_valid)
+
+
+def collect(args) -> None:
+    """Collect a resumable activation archive; labels and final test are absent."""
+    require_cuda()
+    original = json.loads(args.originals.read_text(encoding="utf-8"))
+    variations = json.loads(args.variations.read_text(encoding="utf-8"))
+    cases = plan_cases(original, variations)
+    args.out.mkdir(parents=True, exist_ok=True)
+    tokenizer, spec = io.model_context(args)
+    if spec["dtype"] != "bfloat16":
+        raise ValueError("collector stores native BF16 states; use --dtype bfloat16")
+    if getattr(tokenizer, "chat_template", None) is None:
+        raise ValueError("collector requires the checkpoint's chat template")
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    def stop(_signum, _frame): raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, stop)
+    model = None
+    try:
+        model = io.load_backbone(spec, args.device, causal=True, allow_download=args.allow_download,
+                                 cpu_offload=args.cpu_offload, gpu_memory_gib=args.gpu_memory_gib,
+                                 offload_folder=args.offload_folder)
+        layers = getattr(getattr(model, "model", None), "layers", ())
+        if len(layers) != 36 or model.config.hidden_size != 4096:
+            raise ValueError("collector contract is pinned to the 36-layer, hidden-size-4096 Qwen checkpoint")
+        io.write_json(args.out / "collection.json", {"format": 1, "model": spec, "total_cases": len(cases),
+                                                       "command": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}})
+        result = collect_all(model, tokenizer, cases, args, spec)
+        io.write_json(args.out / "collection-result.json", result)
+        if result["errors"]:
+            raise RuntimeError(f"collection completed with {result['errors']} failed inputs; see errors.jsonl")
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        if model is not None:
+            del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

@@ -120,7 +120,7 @@ def check_deadline(args) -> None:
 def model_context(args):
     from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerFast, __version__
     identifier = ALIASES.get(args.model, args.model)
-    kw = dict(revision=args.revision, local_files_only=True, trust_remote_code=False)
+    kw = dict(revision=args.revision, local_files_only=not getattr(args, "allow_download", False), trust_remote_code=False)
     config = AutoConfig.from_pretrained(identifier, **kw)
     if getattr(config, "_commit_hash", None):
         kw["revision"] = config._commit_hash  # pin tokenizer to the same snapshot
@@ -144,18 +144,30 @@ def model_context(args):
         raise ValueError("Could not resolve cached model revision")
     tokenizer_state = dict(vocab=tokenizer.get_vocab(), special=tokenizer.special_tokens_map,
                            template=tokenizer.chat_template)
-    spec = dict(model=identifier, revision=revision, local=local.is_dir(), layers=args.layers,
-                max_length=args.max_length, template=args.template, padding="right", truncation="right",
+    spec = dict(model=identifier, revision=revision, local=local.is_dir(), layers=getattr(args, "layers", None),
+                max_length=getattr(args, "max_length", None), template=getattr(args, "template", "chat"), padding="right", truncation="right",
                 dtype=args.dtype, device=args.device, transformers=__version__, torch=str(torch.__version__),
                 tokenizer_sha256=digest(canonical(tokenizer_state).encode()),
                 extractor_sha256=file_hash(Path(__file__).with_name("features.py")))
     return tokenizer, spec
 
 
-def load_backbone(spec, device):
-    from transformers import AutoModel
-    model = AutoModel.from_pretrained(spec["model"], revision=None if spec["local"] else spec["revision"],
-              local_files_only=True, trust_remote_code=False, dtype=getattr(torch, spec["dtype"]))
+def load_backbone(spec, device, *, causal: bool = False, allow_download: bool = False, cpu_offload: bool = False,
+                  gpu_memory_gib: int | None = None, offload_folder: Path | None = None):
+    """Load exactly the recorded checkpoint; collection needs the causal-LM head."""
+    from transformers import AutoModel, AutoModelForCausalLM
+    cls = AutoModelForCausalLM if causal else AutoModel
+    kw = dict(revision=None if spec["local"] else spec["revision"], local_files_only=not allow_download,
+              trust_remote_code=False, dtype=getattr(torch, spec["dtype"]))
+    if cpu_offload:
+        if device != "cuda":
+            raise ValueError("--cpu-offload requires --device cuda")
+        if not gpu_memory_gib or gpu_memory_gib < 1 or offload_folder is None:
+            raise ValueError("--cpu-offload requires positive --gpu-memory-gib and --offload-folder")
+        offload_folder.mkdir(parents=True, exist_ok=True)
+        kw.update(device_map="auto", max_memory={0: f"{gpu_memory_gib}GiB", "cpu": "28GiB"}, offload_folder=str(offload_folder))
+        return cls.from_pretrained(spec["model"], **kw).eval()
+    model = cls.from_pretrained(spec["model"], **kw)
     return model.to(device).eval()
 
 
@@ -345,6 +357,23 @@ def main(run):
     p.add_argument("--threshold", type=float, default=.5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-seconds", type=float, default=300)
+    p = commands.add_parser("collect", help="Generate answers and archive bounded activation observations")
+    p.add_argument("--originals", type=Path, default=ROOT / "data" / "collection_original_tasks.json")
+    p.add_argument("--variations", type=Path, default=ROOT / "variations_tasks.json")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--model", default="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B")
+    p.add_argument("--revision", default="6e8885a6ff5c1dc5201574c8fd700323f23c25fa")
+    p.add_argument("--device", default="cuda", choices=["cuda"])
+    p.add_argument("--dtype", default="bfloat16", choices=["bfloat16"])
+    p.add_argument("--max-prompt-tokens", type=int, default=8192)
+    p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument("--selection-seed", type=int, default=20260910)
+    p.add_argument("--do-sample", action="store_true", help="sample instead of the default greedy decode")
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--allow-download", action="store_true", help="allow first-run model/tokenizer download")
+    p.add_argument("--cpu-offload", action="store_true", help="stage weights through CPU/disk via Accelerate")
+    p.add_argument("--gpu-memory-gib", type=int)
+    p.add_argument("--offload-folder", type=Path, default=ROOT / ".runtime" / "offload")
     p = commands.add_parser("export", help="Package exact run sources plus head, not the whole repo")
     p.add_argument("--name", required=True)
     p.add_argument("--output", type=Path, required=True)
@@ -355,6 +384,13 @@ def main(run):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", args.name):
             parser.error("Invalid run name")
         export(args)
+    elif args.command == "collect":
+        if min(args.max_prompt_tokens, args.max_new_tokens) < 1 or args.temperature <= 0:
+            parser.error("prompt/generation limits and temperature must be positive")
+        if not args.originals.is_file() or not args.variations.is_file():
+            parser.error("originals and variations files must exist")
+        from research.experiment import collect
+        collect(args)
     else:
         import math
         if min(args.epochs, args.batch_size, args.max_length) < 1 or args.width < 0:

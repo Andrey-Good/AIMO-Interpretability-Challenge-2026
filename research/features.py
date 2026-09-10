@@ -4,6 +4,54 @@ B — задачи в батче; T — длина с padding; K — слои; D
 from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
+import hashlib
+
+
+def stable_positions(generation_positions: Sequence[int], *, seed: int, run_id: str) -> list[tuple[int, str]]:
+    """Contract selection: first 8, stable-hash middle 16, last 8; never pad."""
+    positions = sorted(set(generation_positions))
+    if not positions:
+        return []
+    first, last = positions[:8], positions[-8:]
+    middle = sorted(positions, key=lambda p: hashlib.sha256(f"v1:{seed}:{run_id}:{p}".encode()).digest())[:16]
+    roles = {}
+    for p in first: roles[p] = "first8"
+    for p in middle: roles[p] = roles.get(p, "") + "+hash16"
+    for p in last: roles[p] = roles.get(p, "") + "+last8"
+    return [(p, roles[p].strip("+")) for p in sorted(roles)]
+
+
+def output_statistics(logits: Tensor, selected_id: int, *, greedy: bool) -> Tensor:
+    """Top-20 raw logits plus logZ, entropy, raw/policy selected log-probability."""
+    if logits.ndim != 1 or not 0 <= selected_id < logits.numel() or not torch.isfinite(logits).all():
+        raise ValueError("finite one-dimensional logits and valid selected_id required")
+    z = logits.float()
+    logz = torch.logsumexp(z, 0)
+    logp = z - logz
+    entropy = -(logp.exp() * logp).sum()
+    values, ids = torch.topk(z, min(20, z.numel()))
+    policy = torch.zeros((), dtype=torch.float32, device=z.device) if greedy else logp[selected_id]
+    return torch.cat((ids.to(torch.float32), values, torch.stack((logz, entropy, logp[selected_id], policy))))
+
+
+def segment_generation(ids: Sequence[int], close_marker_ids: Sequence[int], *, eos_id: int | None = None) -> tuple[list[str], str]:
+    """Q is handled from template offsets; this strictly labels generated R/A or unknown."""
+    if not close_marker_ids:
+        raise ValueError("actual close-marker token IDs are required")
+    ids, marker = list(ids), list(close_marker_ids)
+    hits = [i for i in range(len(ids)-len(marker)+1) if ids[i:i+len(marker)] == marker]
+    service = {i for start in hits for i in range(start, start + len(marker))}
+    service.update(i for i, token in enumerate(ids) if token == eos_id)
+    if len(hits) != 1:
+        return (["service" if i in service else "unknown" for i in range(len(ids))], "absent" if not hits else "ambiguous")
+    close = hits[0]
+    roles = []
+    for i, token in enumerate(ids):
+        if i in service:
+            roles.append("service")
+        else:
+            roles.append("R" if i < close else "A")
+    return roles, "confirmed"
 
 
 @torch.no_grad()
