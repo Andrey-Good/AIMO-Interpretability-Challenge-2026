@@ -5,6 +5,7 @@ deliberately keeps only one forward pass worth of hook tensors on the GPU.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from collections import deque
 import hashlib
@@ -216,10 +217,17 @@ def render_prompt(tokenizer, question: str) -> tuple[torch.Tensor, list[int], st
     """Render once, then prove template IDs equal offset-tokenized rendered text."""
     messages = [{"role": "user", "content": question}]
     rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    template_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    template = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    # transformers 5 returns a BatchEncoding here; transformers 4 returned the
+    # input-ID list directly.  Compare IDs in both APIs, never the wrapper.
+    template_ids = template["input_ids"] if isinstance(template, Mapping) else template
+    if isinstance(template_ids, torch.Tensor):
+        template_ids = template_ids.tolist()
+    if not isinstance(template_ids, (list, tuple)) or any(not isinstance(token, int) for token in template_ids):
+        raise ValueError("chat template did not return one sequence of integer token IDs")
     encoded = tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)
     ids = encoded["input_ids"]
-    if ids != template_ids:
+    if ids != list(template_ids):
         raise ValueError("chat template token IDs differ from rendered prompt tokenization")
     start = rendered.find(question)
     if start < 0 or rendered.find(question, start + 1) >= 0:

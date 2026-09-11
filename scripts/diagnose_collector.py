@@ -32,6 +32,8 @@ MODEL = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
 REVISION = "6e8885a6ff5c1dc5201574c8fd700323f23c25fa"
 TARGET_INPUTS, TARGET_G, TARGET_SECONDS = 1507, 2048, 5 * 86400
 SCHEMA = 3
+PREFLIGHT_SCHEMA = 1
+PREFLIGHT_MARKER = "diagnostic-preflight.json"
 MODES = {
     "A": "forward + KV cache",
     "B": "A + production HookCapture/take",
@@ -110,12 +112,13 @@ def parser():
     p.add_argument("--out", type=Path, help="отдельный новый каталог; тот же каталог для resume")
     p.add_argument("--hours", type=float, default=5, help="общий бюджет с загрузками, default 5")
     p.add_argument("--decode-tokens", type=int, default=32)
-    p.add_argument("--allow-download", action="store_true", help="разрешить скачать отсутствующие pinned weights")
+    p.add_argument("--allow-download", action="store_true", help="разрешить скачать отсутствующие pinned model files; preflight скачивает только config/tokenizer")
     p.add_argument("--synthetic-repeat", action=argparse.BooleanOptionalAction, default=True,
                    help="повторять короткую natural tape до G1984+window; default enabled")
     p.add_argument("--originals", type=Path, default=ROOT / "data/collection_original_tasks.json")
     p.add_argument("--variations", type=Path, default=ROOT / "variations_tasks.json")
     p.add_argument("--self-test", action="store_true", help="CPU tests без model_context, сети и весов")
+    p.add_argument("--preflight-only", action="store_true", help="проверить pinned config/tokenizer и все 1507 prompts без CUDA и весов")
     p.add_argument("--child", type=Path, help=argparse.SUPPRESS)
     return p
 
@@ -537,6 +540,48 @@ def prepare_inputs(spec, tokenizer, model_spec):
     return {key: by_id[row["case_id"]] for key, row in selected.items()}, identity
 
 
+def preflight_inputs(args, out):
+    """Verify the exact tokenizer and all inputs before allocating either GPU placement."""
+    from research import _support as io
+    context = SimpleNamespace(model=MODEL, revision=REVISION, dtype="bfloat16", device="cuda", layers=None,
+                              max_length=None, template="chat", allow_download=args.allow_download)
+    tokenizer, model_spec = io.model_context(context)
+    _, setup = prepare_inputs({"originals": str(args.originals.resolve()), "variations": str(args.variations.resolve()),
+                               "out": str(out)}, tokenizer, model_spec)
+    return model_spec, setup
+
+
+def write_preflight_failure(out, exc):
+    out.mkdir(parents=True, exist_ok=True)
+    message = f"{type(exc).__name__}: {exc}"
+    (out / "summary.md").write_text("# Диагностика сборщика AIMO\n\n## Preflight не пройден\n\n"
+                                    f"{message}\n\nCUDA, веса и обе GPU-разметки не запускались. "
+                                    "Исправьте tokenizer/input contract и повторите с новым или очищенным diagnostic --out.\n",
+                                    encoding="utf-8")
+    print(f"Preflight failed before GPU/model loading: {message}", file=sys.stderr, flush=True)
+
+
+def verify_preflight_marker(out, identity, study_id):
+    marker = out / PREFLIGHT_MARKER
+    if not marker.exists():
+        return False
+    payload = unseal(marker)
+    selection = out / "input-selection.json"
+    if (payload.get("schema") != PREFLIGHT_SCHEMA or payload.get("study_id") != study_id
+            or payload.get("identity") != identity or not selection.exists()
+            or payload.get("input_selection_sha256") != file_hash(selection)):
+        raise ValueError("preflight marker/input selection differs; use a new --out")
+    return True
+
+
+def write_preflight_marker(out, identity, study_id):
+    selection = out / "input-selection.json"
+    if not selection.exists():
+        raise ValueError("preflight did not produce input selection")
+    sealed(out / PREFLIGHT_MARKER, {"schema": PREFLIGHT_SCHEMA, "study_id": study_id,
+                                    "identity": identity, "input_selection_sha256": file_hash(selection)})
+
+
 def natural_tape(model, tokenizer, case, needed, synthetic):
     import torch
     from research._collector import render_prompt, _input_device
@@ -906,7 +951,7 @@ def restore_budget(state):
 def validate_out(out):
     out = out.resolve()
     forbidden = ("split.json", "study.json", "result.json", "collection-status.json")
-    if out.exists() and not (out / "diagnostic-state.json").exists():
+    if out.exists() and not ((out / "diagnostic-state.json").exists() or (out / PREFLIGHT_MARKER).exists()):
         raise ValueError("--out already exists and is not this diagnostic: refusing to write")
     if any((out / name).exists() for name in forbidden) or (out / "cases").exists():
         raise ValueError("--out looks like a study/production archive: refusing to write")
@@ -937,7 +982,21 @@ def main(args):
         for row in state["cells"]:
             verify_row(out, row, study_id)
     else:
-        out.mkdir(parents=True)
+        state = None
+    verify_preflight_marker(out, identity, study_id)
+    try:
+        model_spec, setup = preflight_inputs(args, out)
+    except Exception as exc:
+        write_preflight_failure(out, exc)
+        return 2
+    print(canonical({"preflight": "passed", "inputs": len(setup["token_inventory"]),
+                     "model": model_spec["model"], "revision": model_spec["revision"]}), flush=True)
+    if args.preflight_only:
+        write_preflight_marker(out, identity, study_id)
+        print(f"Preflight report: {out / 'input-selection.json'}", flush=True)
+        return 0
+    if state is None:
+        out.mkdir(parents=True, exist_ok=True)
         state = {"schema": SCHEMA, "study_id": study_id, "identity": identity,
                  "budget_seconds": args.hours * 3600, "spent_seconds": 0, "group_spent": {}, "stage_spent": {},
                  "hardware_initial": hardware(out), "cells": [{**definition, "status": "pending"} for definition in make_cells()],
@@ -1081,6 +1140,25 @@ def self_test():
     tokens = [4, 7, 8, 5, 6]
     try:
         with patched(io, model_context=forbidden, load_backbone=forbidden), patched(c, LAYERS=(0, 1)):
+            class PromptTokenizer:
+                def __init__(self, template): self.template = template
+                def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                    text = "U:" + messages[0]["content"] + "\\nA:"
+                    return self.template if tokenize else text
+                def __call__(self, text, **_kwargs):
+                    return {"input_ids": [1, 2, 3, 4, 5, 6],
+                            "offset_mapping": [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]}
+            expected_ids = [1, 2, 3, 4, 5, 6]
+            for template in (expected_ids, {"input_ids": expected_ids, "attention_mask": [1] * len(expected_ids)}):
+                rendered_prompt, positions, rendered_text = c.render_prompt(PromptTokenizer(template), "q")
+                check(rendered_prompt.tolist() == expected_ids and positions == [2] and rendered_text == "U:q\\nA:",
+                      "render_prompt accepts " + ("BatchEncoding" if isinstance(template, dict) else "token-ID list"))
+            try:
+                c.render_prompt(PromptTokenizer([1, 2, 9, 4, 5, 6]), "q")
+            except ValueError as exc:
+                check("differ" in str(exc), "render_prompt rejects genuine unequal token IDs")
+            else:
+                raise AssertionError("unequal template IDs accepted")
             prefix, window = make_prefix(prompt, list(range(20)), 8, 5, 4096)
             check(prefix.tolist() == [1, 2, 3] + list(range(8)) and window == list(range(8, 13)), "G offset appends tape, preserves original prompt")
             try:
@@ -1196,6 +1274,39 @@ def self_test():
                     tests.append("unowned output directory refused")
                 else:
                     raise AssertionError("unowned output accepted")
+                module = sys.modules[__name__]
+                identity = {"lifecycle": "stable"}
+                def fake_preflight(args, target):
+                    sealed(target / "input-selection.json", {"token_inventory": [{"case_id": "fake", "tokens": 1}]})
+                    return {"model": "fake", "revision": "pinned"}, {"token_inventory": [{"case_id": "fake", "tokens": 1}]}
+                def fake_supervise(*_args, **_kwargs):
+                    return {"status": "success", "reason": "fake child"}
+                def lifecycle_args(target, preflight_only):
+                    return SimpleNamespace(self_test=False, out=target, hours=1, decode_tokens=1,
+                                           preflight_only=preflight_only, allow_download=False,
+                                           synthetic_repeat=True, originals=target / "originals.json",
+                                           variations=target / "variations.json")
+                with patched(module, study_identity=lambda _args: identity, preflight_inputs=fake_preflight,
+                             make_cells=lambda: [cell("fake", "A")], supervise=fake_supervise):
+                    fresh = out / "normal-fresh"
+                    check(main(lifecycle_args(fresh, False)) == 0 and (fresh / "diagnostic-state.json").exists(),
+                          "normal fresh start creates state after preflight input selection")
+                    staged = out / "preflight-then-normal"
+                    check(main(lifecycle_args(staged, True)) == 0 and (staged / PREFLIGHT_MARKER).exists()
+                          and not (staged / "diagnostic-state.json").exists(),
+                          "preflight-only writes verified diagnostic marker")
+                    check(main(lifecycle_args(staged, False)) == 0 and (staged / "diagnostic-state.json").exists(),
+                          "normal run accepts same verified preflight output")
+                    before = {name: file_hash(staged / name) for name in (PREFLIGHT_MARKER, "input-selection.json", "diagnostic-state.json")}
+                    with patched(module, study_identity=lambda _args: {"lifecycle": "changed"}):
+                        try:
+                            main(lifecycle_args(staged, True))
+                        except ValueError:
+                            tests.append("mismatched resume rejects before preflight mutation")
+                        else:
+                            raise AssertionError("mismatched resume accepted")
+                    check(before == {name: file_hash(staged / name) for name in before},
+                          "mismatched resume leaves diagnostic artifacts unchanged")
     finally:
         torch.set_num_threads(default_threads)
     print(canonical({"self_test": "passed", "checks": len(tests), "tests": tests,
